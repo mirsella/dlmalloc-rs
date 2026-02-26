@@ -4,13 +4,18 @@ use core::arch::wasm32 as wasm;
 #[cfg(target_arch = "wasm64")]
 use core::arch::wasm64 as wasm;
 use core::ptr;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
 
 extern "C" {
     static __heap_base: u8;
+    static __heap_end: u8;
 }
 
-static BUMP: AtomicUsize = AtomicUsize::new(0);
+const PREEXISTING_UNTRIED: u8 = 0;
+const PREEXISTING_DONATED: u8 = 1;
+const PREEXISTING_DISABLED: u8 = 2;
+
+static PREEXISTING_STATE: AtomicU8 = AtomicU8::new(PREEXISTING_UNTRIED);
 
 fn align_up(value: usize, alignment: usize) -> Option<usize> {
     value
@@ -18,36 +23,90 @@ fn align_up(value: usize, alignment: usize) -> Option<usize> {
         .map(|v| v & !(alignment - 1))
 }
 
-fn alloc_from_preexisting(
+fn preexisting_chunk(
     size: usize,
     page_size: usize,
-    current_memory: usize,
-    bump: usize,
     heap_base: usize,
-) -> Option<(usize, usize, usize)> {
-    let start = if bump == 0 {
-        align_up(heap_base, page_size)?
-    } else {
-        bump
-    };
-
+    heap_end: usize,
+    current_memory: usize,
+) -> Option<(usize, usize)> {
+    let start = align_up(heap_base, page_size)?;
     if start == 0 {
         return None;
     }
 
-    if start >= current_memory {
+    let end = core::cmp::min(heap_end, current_memory);
+    if end <= start {
         return None;
     }
 
-    let remaining = current_memory - start;
-    if remaining < size {
+    let len = end - start;
+    if len < size {
         return None;
     }
 
-    Some((start, remaining, current_memory))
+    Some((start, len))
 }
 
-/// System setting for Wasm
+fn try_donate_preexisting(
+    state: &AtomicU8,
+    chunk: Option<(usize, usize)>,
+) -> Option<(usize, usize)> {
+    if state.load(Ordering::Relaxed) != PREEXISTING_UNTRIED {
+        return None;
+    }
+
+    match chunk {
+        Some(chunk) => {
+            if state
+                .compare_exchange(
+                    PREEXISTING_UNTRIED,
+                    PREEXISTING_DONATED,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                Some(chunk)
+            } else {
+                None
+            }
+        }
+        None => {
+            let _ = state.compare_exchange(
+                PREEXISTING_UNTRIED,
+                PREEXISTING_DISABLED,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            None
+        }
+    }
+}
+
+fn alloc_via_grow(size: usize, page_size: usize) -> (*mut u8, usize, u32) {
+    let pages = size.div_ceil(page_size);
+    let prev = wasm::memory_grow(0, pages);
+
+    if prev == usize::max_value() {
+        return (ptr::null_mut(), 0, 0);
+    }
+
+    let prev_page = prev * page_size;
+    let base_ptr = prev_page as *mut u8;
+    let size = pages * page_size;
+
+    if prev_page.wrapping_add(size) == 0 {
+        return (base_ptr, size - 16, 0);
+    }
+
+    (base_ptr, size, 0)
+}
+
+/// System setting for Wasm.
+///
+/// This is the default wasm allocator backend and only allocates by growing
+/// linear memory with `memory.grow`.
 pub struct System {
     _priv: (),
 }
@@ -60,67 +119,73 @@ impl System {
 
 unsafe impl Allocator for System {
     fn alloc(&self, size: usize) -> (*mut u8, usize, u32) {
-        if size == 0 {
-            return (ptr::null_mut(), 0, 0);
-        }
-
-        let page_size = self.page_size();
-        let current_memory = match wasm::memory_size(0).checked_mul(page_size) {
-            Some(v) => v,
-            None => return (ptr::null_mut(), 0, 0),
-        };
-
-        let heap_base = unsafe { &__heap_base as *const u8 as usize };
-        let bump = BUMP.load(Ordering::Relaxed);
-        if let Some((base, len, next_bump)) =
-            alloc_from_preexisting(size, page_size, current_memory, bump, heap_base)
-        {
-            // Mark all pre-existing memory as consumed so we won't ever hand it
-            // out again after subsequent growth.
-            BUMP.store(next_bump, Ordering::Relaxed);
-            return (base as *mut u8, len, 0);
-        }
-
-        let rounded = match size.max(page_size).checked_add(page_size - 1) {
-            Some(v) => v & !(page_size - 1),
-            None => return (ptr::null_mut(), 0, 0),
-        };
-        let pages = rounded / page_size;
-        let prev = wasm::memory_grow(0, pages);
-
-        // If the allocation failed, meaning `prev` is -1 or
-        // `usize::max_value()`, then return null.
-        if prev == usize::max_value() {
-            return (ptr::null_mut(), 0, 0);
-        }
-
-        let prev_page = prev * page_size;
-        let base_ptr = prev_page as *mut u8;
-        let size = pages * page_size;
-
-        // Prevent later allocations from treating the newly grown pages as
-        // "pre-existing" memory.
-        if let Some(new_end) = prev_page.checked_add(size) {
-            BUMP.store(new_end, Ordering::Relaxed);
-        }
-
-        // Additionally check to see if we just allocated the final bit of the
-        // address space. In such a situation it's not valid in Rust for a
-        // pointer to actually wrap around to from the top of the address space
-        // to 0, so it's not valid to allocate the entire region. Fake the last
-        // few bytes as being un-allocated meaning that the actual size of this
-        // allocation won't be page aligned, which should be handled by
-        // dlmalloc.
-        if prev_page.wrapping_add(size) == 0 {
-            BUMP.store(usize::MAX, Ordering::Relaxed);
-            return (base_ptr, size - 16, 0);
-        }
-
-        (base_ptr, size, 0)
+        alloc_via_grow(size, self.page_size())
     }
 
     fn remap(&self, _ptr: *mut u8, _oldsize: usize, _newsize: usize, _can_move: bool) -> *mut u8 {
-        // TODO: I think this can be implemented near the end?
+        ptr::null_mut()
+    }
+
+    fn free_part(&self, _ptr: *mut u8, _oldsize: usize, _newsize: usize) -> bool {
+        false
+    }
+
+    fn free(&self, _ptr: *mut u8, _size: usize) -> bool {
+        false
+    }
+
+    fn can_release_part(&self, _flags: u32) -> bool {
+        false
+    }
+
+    fn allocates_zeros(&self) -> bool {
+        true
+    }
+
+    fn page_size(&self) -> usize {
+        64 * 1024
+    }
+}
+
+/// Opt-in wasm allocator backend that can donate the pre-existing linear
+/// memory region to dlmalloc once.
+///
+/// This allocator assumes the region between `__heap_base` and `__heap_end`
+/// can be exclusively owned by dlmalloc. Only use this if no other runtime or
+/// allocator in the module also expects to own that region.
+pub struct PreexistingSystem {
+    _priv: (),
+}
+
+impl PreexistingSystem {
+    /// Creates a new opt-in preexisting-heap allocator backend.
+    pub const fn new() -> PreexistingSystem {
+        PreexistingSystem { _priv: () }
+    }
+}
+
+unsafe impl Allocator for PreexistingSystem {
+    fn alloc(&self, size: usize) -> (*mut u8, usize, u32) {
+        let page_size = self.page_size();
+
+        if size != 0 {
+            let current_memory = match wasm::memory_size(0).checked_mul(page_size) {
+                Some(v) => v,
+                None => return (ptr::null_mut(), 0, 0),
+            };
+            let heap_base = unsafe { &__heap_base as *const u8 as usize };
+            let heap_end = unsafe { &__heap_end as *const u8 as usize };
+
+            let chunk = preexisting_chunk(size, page_size, heap_base, heap_end, current_memory);
+            if let Some((base, len)) = try_donate_preexisting(&PREEXISTING_STATE, chunk) {
+                return (base as *mut u8, len, 0);
+            }
+        }
+
+        alloc_via_grow(size, page_size)
+    }
+
+    fn remap(&self, _ptr: *mut u8, _oldsize: usize, _newsize: usize, _can_move: bool) -> *mut u8 {
         ptr::null_mut()
     }
 
@@ -147,7 +212,11 @@ unsafe impl Allocator for System {
 
 #[cfg(test)]
 mod tests {
-    use super::{align_up, alloc_from_preexisting};
+    use super::{
+        align_up, preexisting_chunk, try_donate_preexisting, PREEXISTING_DISABLED,
+        PREEXISTING_DONATED, PREEXISTING_UNTRIED,
+    };
+    use core::sync::atomic::{AtomicU8, Ordering};
 
     fn legacy_grow_only(
         size: usize,
@@ -164,77 +233,82 @@ mod tests {
     #[test]
     fn uses_preexisting_memory_when_growth_fails() {
         let page_size = 64 * 1024;
+        let heap_base = page_size;
+        let heap_end = page_size * 4;
         let current_memory = page_size * 4;
-        let bump = page_size;
-        let heap_base = 0;
 
-        let new_behavior = alloc_from_preexisting(16, page_size, current_memory, bump, heap_base);
+        let chunk = preexisting_chunk(16, page_size, heap_base, heap_end, current_memory).unwrap();
+        let state = AtomicU8::new(PREEXISTING_UNTRIED);
+        let new_behavior = try_donate_preexisting(&state, Some(chunk));
         let legacy_behavior = legacy_grow_only(16, page_size, usize::MAX);
 
-        assert_eq!(
-            new_behavior,
-            Some((page_size, page_size * 3, current_memory))
-        );
+        assert_eq!(new_behavior, Some((page_size, page_size * 3)));
         assert_eq!(legacy_behavior, None);
+        assert_eq!(state.load(Ordering::Relaxed), PREEXISTING_DONATED);
     }
 
     #[test]
-    fn aligns_heap_base_when_bump_uninitialized() {
+    fn uses_heap_end_as_upper_bound() {
         let page_size = 64 * 1024;
-        let current_memory = page_size * 3;
-        let heap_base = page_size + 17;
-        let expected = align_up(heap_base, page_size).unwrap();
-
-        let alloc = alloc_from_preexisting(1, page_size, current_memory, 0, heap_base).unwrap();
-        assert_eq!(alloc.0, expected);
-        assert_eq!(alloc.1, current_memory - expected);
-        assert_eq!(alloc.2, current_memory);
-    }
-
-    #[test]
-    fn returns_none_when_remaining_too_small() {
-        let page_size = 64 * 1024;
-        let current_memory = page_size * 2;
-        let bump = current_memory - 8;
-
-        let alloc = alloc_from_preexisting(16, page_size, current_memory, bump, 0);
-        assert_eq!(alloc, None);
-    }
-
-    #[test]
-    fn does_not_treat_grown_pages_as_preexisting() {
-        let page_size = 64 * 1024;
-        let preexisting_end = page_size * 4;
-        let after_grow_current_memory = page_size * 6;
         let heap_base = page_size;
-        let start = align_up(heap_base, page_size).unwrap();
+        let heap_end = page_size * 4;
+        let current_memory = page_size * 8;
 
-        let alloc = alloc_from_preexisting(16, page_size, preexisting_end, 0, heap_base).unwrap();
-        assert_eq!(alloc.0, start);
-        assert_eq!(alloc.1, preexisting_end - start);
-
-        // If the allocator incorrectly used `current_memory` after growth as
-        // the pre-existing limit, it would hand out a region that includes the
-        // grown pages, overlapping memory already returned by `memory.grow`.
-        let incorrect =
-            alloc_from_preexisting(16, page_size, after_grow_current_memory, 0, heap_base).unwrap();
-        assert_eq!(incorrect.1, after_grow_current_memory - start);
-        assert_ne!(alloc.1, incorrect.1);
+        let chunk = preexisting_chunk(16, page_size, heap_base, heap_end, current_memory).unwrap();
+        assert_eq!(chunk, (page_size, page_size * 3));
     }
 
     #[test]
-    fn bump_prevents_reusing_preexisting_after_growth() {
+    fn one_chunk_or_never_disables_after_failure() {
         let page_size = 64 * 1024;
-        let current_memory = page_size * 6;
+        let heap_base = page_size;
+        let heap_end = page_size * 2;
+        let current_memory = page_size * 8;
+        let state = AtomicU8::new(PREEXISTING_UNTRIED);
 
-        // After a successful memory.grow, we set BUMP to the new end.
-        // That must prevent the pre-existing allocator from handing out any
-        // region based on the new `current_memory`.
-        let bump = current_memory;
+        let first = preexisting_chunk(
+            page_size * 3,
+            page_size,
+            heap_base,
+            heap_end,
+            current_memory,
+        );
+        assert_eq!(first, None);
+        assert_eq!(try_donate_preexisting(&state, first), None);
+        assert_eq!(state.load(Ordering::Relaxed), PREEXISTING_DISABLED);
+
+        let second = preexisting_chunk(16, page_size, heap_base, heap_end, current_memory);
+        assert_eq!(second, Some((page_size, page_size)));
+        assert_eq!(try_donate_preexisting(&state, second), None);
+    }
+
+    #[test]
+    fn one_chunk_donates_only_once() {
+        let state = AtomicU8::new(PREEXISTING_UNTRIED);
+
+        assert_eq!(
+            try_donate_preexisting(&state, Some((64 * 1024, 128 * 1024))),
+            Some((64 * 1024, 128 * 1024))
+        );
+        assert_eq!(state.load(Ordering::Relaxed), PREEXISTING_DONATED);
+        assert_eq!(
+            try_donate_preexisting(&state, Some((64 * 1024, 64 * 1024))),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_zero_start() {
+        let page_size = 64 * 1024;
         let heap_base = 0;
+        let heap_end = page_size * 4;
+        let current_memory = page_size * 8;
 
-        let alloc = alloc_from_preexisting(16, page_size, current_memory, bump, heap_base);
-        assert_eq!(alloc, None);
+        assert_eq!(
+            preexisting_chunk(16, page_size, heap_base, heap_end, current_memory),
+            None
+        );
+        assert_eq!(align_up(heap_base, page_size), Some(0));
     }
 }
 
